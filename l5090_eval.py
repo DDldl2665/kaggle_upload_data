@@ -55,22 +55,47 @@ class TFLiteDetector(BaseDetector):
         self.imgsz = imgsz
         self.interpreter = tf.lite.Interpreter(model_path=weight_path)
         self.interpreter.allocate_tensors()
+
         self.input_details = self.interpreter.get_input_details()
         self.output_details = self.interpreter.get_output_details()
 
+        self.input_index = self.input_details[0]["index"]
+        self.output_index = self.output_details[0]["index"]
+
+        self.input_dtype = self.input_details[0]["dtype"]
+        self.scale, self.zero_point = self.input_details[0]["quantization"]
+
     def predict(self, frame: np.ndarray):
+
+        # resize
         frame = cv2.resize(frame, (self.imgsz, self.imgsz))
-        frame = frame.astype(np.float32) / 255.0
+
+        if self.input_dtype == np.float32:
+            frame = frame.astype(np.float32) / 255.0
+
+        elif self.input_dtype == np.int8:
+            frame = frame.astype(np.float32) / 255.0
+
+            if self.scale == 0:
+                raise RuntimeError("INT8 model but quantization scale=0")
+
+            frame = frame / self.scale + self.zero_point
+            frame = np.clip(frame, -128, 127).astype(np.int8)
+
+        elif self.input_dtype == np.uint8:
+            frame = frame.astype(np.float32) / 255.0
+            frame = frame / self.scale + self.zero_point
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+
+        else:
+            raise RuntimeError(f"Unsupported input dtype: {self.input_dtype}")
+
         frame = np.expand_dims(frame, axis=0)
 
-        self.interpreter.set_tensor(
-            self.input_details[0]["index"], frame
-        )
+        self.interpreter.set_tensor(self.input_index, frame)
         self.interpreter.invoke()
 
-        output = self.interpreter.get_tensor(
-            self.output_details[0]["index"]
-        )
+        output = self.interpreter.get_tensor(self.output_index)
 
         return np.max(output) > 0.5
 
@@ -136,7 +161,7 @@ def evaluate_L5090(
     weight_path: str,
     target_class: List[int],
     imgsz: int,
-    video_root: str = "/kaggle/input/pet-yolo-zoom-out-vid/zoom_out",
+    video_root: str = "/kaggle/input/datasets/ddl1981/pet-yolo-zoom-out-vid/zoom_out/",
     k_consec_miss: int = 20,
     bin_width: int = 3,
 ):
