@@ -49,10 +49,21 @@ class YOLOPtDetector(BaseDetector):
 
 
 class TFLiteDetector(BaseDetector):
-    def __init__(self, weight_path: str, imgsz: int):
+    def __init__(
+        self,
+        weight_path: str,
+        imgsz: int,
+        target_class,
+        conf_thres: float = 0.25,
+        iou_thres: float = 0.45,
+    ):
         import tensorflow as tf
 
         self.imgsz = imgsz
+        self.target_class = target_class
+        self.conf_thres = conf_thres
+        self.iou_thres = iou_thres
+
         self.interpreter = tf.lite.Interpreter(model_path=weight_path)
         self.interpreter.allocate_tensors()
 
@@ -63,41 +74,125 @@ class TFLiteDetector(BaseDetector):
         self.output_index = self.output_details[0]["index"]
 
         self.input_dtype = self.input_details[0]["dtype"]
-        self.scale, self.zero_point = self.input_details[0]["quantization"]
+        self.in_scale, self.in_zero = self.input_details[0]["quantization"]
 
-    def predict(self, frame: np.ndarray):
+        self.out_scale, self.out_zero = self.output_details[0]["quantization"]
 
-        # resize
-        frame = cv2.resize(frame, (self.imgsz, self.imgsz))
+    # =========================================================
+    # Preprocess
+    # =========================================================
+    def _preprocess(self, frame):
+
+        img = cv2.resize(frame, (self.imgsz, self.imgsz))
 
         if self.input_dtype == np.float32:
-            frame = frame.astype(np.float32) / 255.0
-
-        elif self.input_dtype == np.int8:
-            frame = frame.astype(np.float32) / 255.0
-
-            if self.scale == 0:
-                raise RuntimeError("INT8 model but quantization scale=0")
-
-            frame = frame / self.scale + self.zero_point
-            frame = np.clip(frame, -128, 127).astype(np.int8)
-
-        elif self.input_dtype == np.uint8:
-            frame = frame.astype(np.float32) / 255.0
-            frame = frame / self.scale + self.zero_point
-            frame = np.clip(frame, 0, 255).astype(np.uint8)
+            img = img.astype(np.float32) / 255.0
 
         else:
-            raise RuntimeError(f"Unsupported input dtype: {self.input_dtype}")
+            img = img.astype(np.float32) / 255.0
+            img = img / self.in_scale + self.in_zero
 
-        frame = np.expand_dims(frame, axis=0)
+            if self.input_dtype == np.int8:
+                img = np.clip(img, -128, 127).astype(np.int8)
+            elif self.input_dtype == np.uint8:
+                img = np.clip(img, 0, 255).astype(np.uint8)
+            else:
+                raise RuntimeError(f"Unsupported dtype: {self.input_dtype}")
 
-        self.interpreter.set_tensor(self.input_index, frame)
+        img = np.expand_dims(img, axis=0)
+        return img
+
+    # =========================================================
+    # Postprocess
+    # =========================================================
+    def _postprocess(self, output):
+
+        # 反量化
+        if self.output_details[0]["dtype"] != np.float32:
+            output = (output.astype(np.float32) - self.out_zero) * self.out_scale
+
+        output = output[0]  # remove batch
+
+        # YOLO typical shape:
+        # (8400, 85) or (N, 5 + num_classes)
+
+        if output.shape[-1] < 6:
+            raise RuntimeError("輸出格式不像 YOLO detection")
+
+        boxes = output[:, :4]
+        obj_conf = output[:, 4]
+        class_scores = output[:, 5:]
+
+        class_ids = np.argmax(class_scores, axis=1)
+        class_conf = class_scores[np.arange(len(class_scores)), class_ids]
+
+        final_conf = obj_conf * class_conf
+
+        # class filter
+        mask = np.isin(class_ids, self.target_class)
+        boxes = boxes[mask]
+        final_conf = final_conf[mask]
+
+        # conf threshold
+        mask2 = final_conf > self.conf_thres
+        boxes = boxes[mask2]
+        final_conf = final_conf[mask2]
+
+        if len(boxes) == 0:
+            return False
+
+        # NMS
+        keep = self._nms(boxes, final_conf)
+        return len(keep) > 0
+
+    # =========================================================
+    # IoU + NMS
+    # =========================================================
+    def _nms(self, boxes, scores):
+
+        x1 = boxes[:, 0] - boxes[:, 2] / 2
+        y1 = boxes[:, 1] - boxes[:, 3] / 2
+        x2 = boxes[:, 0] + boxes[:, 2] / 2
+        y2 = boxes[:, 1] + boxes[:, 3] / 2
+
+        areas = (x2 - x1) * (y2 - y1)
+        order = scores.argsort()[::-1]
+
+        keep = []
+
+        while order.size > 0:
+            i = order[0]
+            keep.append(i)
+
+            xx1 = np.maximum(x1[i], x1[order[1:]])
+            yy1 = np.maximum(y1[i], y1[order[1:]])
+            xx2 = np.minimum(x2[i], x2[order[1:]])
+            yy2 = np.minimum(y2[i], y2[order[1:]])
+
+            w = np.maximum(0.0, xx2 - xx1)
+            h = np.maximum(0.0, yy2 - yy1)
+
+            inter = w * h
+            iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+
+            inds = np.where(iou <= self.iou_thres)[0]
+            order = order[inds + 1]
+
+        return keep
+
+    # =========================================================
+    # Public predict
+    # =========================================================
+    def predict(self, frame: np.ndarray):
+
+        input_tensor = self._preprocess(frame)
+
+        self.interpreter.set_tensor(self.input_index, input_tensor)
         self.interpreter.invoke()
 
         output = self.interpreter.get_tensor(self.output_index)
 
-        return np.max(output) > 0.5
+        return self._postprocess(output)
 
 
 def _build_detector(weight_path: str, imgsz: int, target_class: List[int]) -> BaseDetector:
