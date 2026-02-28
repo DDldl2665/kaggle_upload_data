@@ -201,7 +201,7 @@ def _build_detector(weight_path: str, imgsz: int, target_class: List[int]) -> Ba
     if suffix == ".pt":
         return YOLOPtDetector(weight_path, imgsz, target_class)
     elif suffix == ".tflite":
-        return TFLiteDetector(weight_path, imgsz)
+        return TFLiteDetector(weight_path, imgsz, target_class)
     else:
         raise ValueError(f"不支援的模型格式: {suffix}")
 
